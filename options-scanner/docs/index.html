@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Scanner">
+
+<title>Options Scanner</title>
+<style>
+:root{--bg:#0b0f14;--card:#151b23;--tx:#e8edf2;--mu:#8b97a5;--g:#3ddc97;--r:#ff6b6b;--y:#ffd166;--bd:#243040}
+@media(prefers-color-scheme:light){:root{--bg:#f4f6f8;--card:#fff;--tx:#10161d;--mu:#5d6a78;--g:#0a9d62;--r:#d33;--y:#a67300;--bd:#dde3ea}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px -apple-system,system-ui,sans-serif;padding:max(12px,env(safe-area-inset-top)) 16px 40px}
+h1{font-size:20px;margin:6px 0 2px}.sub{color:var(--mu);font-size:12px}
+.warn{background:var(--card);border:1px solid var(--bd);border-left:3px solid var(--y);padding:10px;border-radius:8px;font-size:12px;color:var(--mu);margin:10px 0}
+.ctl{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}
+label{font-size:11px;color:var(--mu);display:block}input{width:100%;padding:9px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--tx);font-size:16px}
+.full{grid-column:1/3}button{width:100%;padding:12px;border-radius:10px;border:0;background:var(--g);color:#04130c;font-weight:700;font-size:16px}
+.c{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin:10px 0}
+.h{display:flex;justify-content:space-between;align-items:baseline}.sym{font-weight:700;font-size:17px}
+.call{color:var(--g)}.put{color:var(--r)}.mu{color:var(--mu);font-size:12px}
+.g{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}.g div{font-size:11px;color:var(--mu)}.g b{display:block;color:var(--tx);font-size:14px}
+.occ{font:11px ui-monospace,monospace;color:var(--mu);margin-top:6px;word-break:break-all}
+.sc{margin-top:8px;font-size:12px;border-top:1px solid var(--bd);padding-top:8px}
+</style></head><body>
+<h1>Options Scanner</h1><div class="sub" id="meta">Short-dated OTM lottery tickets</div>
+<div class="warn"><b>Read this.</b> Cheap short-dated OTM options usually expire worthless. The "% to profit" figure is a model estimate from implied volatility, not a prediction. Size every ticket at an amount you can lose entirely. Not financial advice.</div>
+<div class="ctl">
+<div><label>Budget $</label><input id="budget" type="number" inputmode="decimal" value="1000"></div>
+<div><label>Max days to expiry</label><input id="maxDte" type="number" inputmode="numeric" value="7"></div>
+<div><label>Max ask $/share</label><input id="maxAsk" type="number" inputmode="decimal" value="3"></div>
+<div><label>Max spread %</label><input id="spread" type="number" inputmode="numeric" value="30"></div>
+<div class="full"><label>Tickers (comma separated)</label><input id="symbols" value="SPY,QQQ,IWM,NVDA,TSLA,AAPL,AMD,META,AMZN,PLTR,MSFT,GOOGL,COIN,MSTR"></div>
+<div><label>Alpaca key ID</label><input id="kid" autocomplete="off" autocapitalize="off"></div><div><label>Alpaca secret</label><input id="ksec" type="password" autocomplete="off"></div><div class="full mu">Keys are stored only in this browser and sent only to Alpaca. Leave blank for demo data.</div><div class="full"><button id="go">Scan now</button></div></div>
+<div id="out"></div>
+<script>
+
+// Lottery-ticket options scanner: short-dated, out-of-the-money, cheap contracts.
+// Pure functions only (no I/O) so they are easy to test.
+
+const DEFAULTS = {
+  budget: 1000,
+  maxDte: 7,
+  minDte: 0,
+  minAbsDelta: 0.08,
+  maxAbsDelta: 0.35,
+  minAsk: 0.05,
+  maxAsk: 3.0,
+  maxSpreadPct: 0.3,
+  minIv: 0.05,
+};
+
+function erf(x) {
+  const s = Math.sign(x);
+  x = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return s * y;
+}
+const normCdf = (z) => 0.5 * (1 + erf(z / Math.SQRT2));
+
+// OCC symbol, e.g. NVDA251121C00150000
+function parseOcc(sym) {
+  const m = /^([A-Z.]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/.exec(sym);
+  if (!m) return null;
+  return {
+    root: m[1],
+    expiry: `20${m[2]}-${m[3]}-${m[4]}`,
+    type: m[5] === 'C' ? 'call' : 'put',
+    strike: parseInt(m[6], 10) / 1000,
+  };
+}
+
+function dteFrom(expiry, now = new Date()) {
+  const exp = Date.parse(`${expiry}T20:00:00Z`); // ~4pm ET close
+  return Math.max(0, (exp - now.getTime()) / 86400000);
+}
+
+// snap: { symbol, bid, ask, delta, theta, iv }
+function evaluate(snap, spot, opts = {}, now = new Date()) {
+  const o = { ...DEFAULTS, ...opts };
+  const occ = parseOcc(snap.symbol);
+  if (!occ || !(spot > 0)) return null;
+  const { bid, ask, delta, iv } = snap;
+  if (!(ask > 0) || !(bid >= 0) || !(iv >= o.minIv)) return null;
+
+  const dte = dteFrom(occ.expiry, now);
+  if (dte > o.maxDte + 1 || dte < o.minDte) return null;
+  const isCall = occ.type === 'call';
+  const otm = isCall ? occ.strike > spot : occ.strike < spot;
+  if (!otm) return null;
+
+  const absDelta = Math.abs(delta ?? NaN);
+  if (!(absDelta >= o.minAbsDelta && absDelta <= o.maxAbsDelta)) return null;
+  if (ask < o.minAsk || ask > o.maxAsk) return null;
+  const mid = (bid + ask) / 2;
+  const spreadPct = (ask - bid) / mid;
+  if (spreadPct > o.maxSpreadPct) return null;
+
+  const T = Math.max(dte, 0.05) / 365;
+  const em = iv * Math.sqrt(T) * spot; // 1-sigma expected move ($)
+  const breakeven = isCall ? occ.strike + ask : occ.strike - ask;
+  const moveNeeded = Math.abs(breakeven - spot);
+  const z = moveNeeded / em;
+  const probProfit = 1 - normCdf(z); // terminal probability under the IV-implied model
+
+  const payoffAt = (sigmas) => {
+    const px = isCall ? spot + sigmas * em : spot - sigmas * em;
+    const intrinsic = isCall ? Math.max(0, px - occ.strike) : Math.max(0, occ.strike - px);
+    return { price: px, multiple: intrinsic / ask };
+  };
+  const p1 = payoffAt(1), p15 = payoffAt(1.5), p2 = payoffAt(2);
+  const contracts = Math.max(0, Math.floor(o.budget / (ask * 100)));
+
+  // Rank: reward multiple at a 1.5σ move × realistic odds, penalise wide spreads.
+  const score = (p15.multiple * probProfit) * (1 - Math.min(spreadPct, 0.5));
+
+  return {
+    contract: snap.symbol, underlying: occ.root, type: occ.type, strike: occ.strike,
+    expiry: occ.expiry, dte: +dte.toFixed(2), spot,
+    bid, ask, mid: +mid.toFixed(3), spreadPct: +(spreadPct * 100).toFixed(1),
+    costPerContract: +(ask * 100).toFixed(2), contracts, totalCost: +(contracts * ask * 100).toFixed(2),
+    breakeven: +breakeven.toFixed(2), movePct: +((moveNeeded / spot) * 100).toFixed(2),
+    expectedMove: +em.toFixed(2), sigmasToBreakeven: +z.toFixed(2),
+    probProfitPct: +(probProfit * 100).toFixed(1),
+    delta: +delta.toFixed(3), theta: snap.theta ?? null, ivPct: +(iv * 100).toFixed(0),
+    scenarios: { s1: p1, s15: p15, s2: p2 },
+    score: +score.toFixed(3),
+  };
+}
+
+function scan(snaps, spot, opts, now) {
+  return snaps.map((s) => evaluate(s, spot, opts, now)).filter(Boolean);
+}
+
+
+const $=id=>document.getElementById(id), usd=n=>'$'+Number(n).toLocaleString(undefined,{maximumFractionDigits:2});
+const F=['budget','maxDte','maxAsk','spread','symbols','kid','ksec'];
+for(const k of F){try{const v=localStorage.getItem('os_'+k);if(v)$(k).value=v}catch{}}
+const BASE='https://data.alpaca.markets';
+async function gj(u,h){const r=await fetch(u,{headers:h});if(!r.ok)throw new Error(r.status+' '+(await r.text()).slice(0,120));return r.json()}
+function live(kid,sec){const h={'APCA-API-KEY-ID':kid,'APCA-API-SECRET-KEY':sec};return{name:'alpaca',
+ async spot(s){const j=await gj(`${BASE}/v2/stocks/${s}/snapshot?feed=iex`,h);return j.latestTrade?.p??j.dailyBar?.c},
+ async chain(s,o){const lte=new Date(Date.now()+(o.maxDte+1)*864e5).toISOString().slice(0,10),gte=new Date().toISOString().slice(0,10);let out=[],t='';
+  for(let p=0;p<10;p++){const j=await gj(`${BASE}/v1beta1/options/snapshots/${s}?feed=indicative&limit=1000&expiration_date_gte=${gte}&expiration_date_lte=${lte}${t?'&page_token='+t:''}`,h);
+   for(const[sym,x]of Object.entries(j.snapshots||{}))out.push({symbol:sym,bid:x.latestQuote?.bp,ask:x.latestQuote?.ap,delta:x.greeks?.delta,theta:x.greeks?.theta,iv:x.impliedVolatility});
+   t=j.next_page_token;if(!t)break}return out}}}
+function demo(){const sp={SPY:600,QQQ:520,NVDA:180,TSLA:350,AAPL:230};return{name:'demo',async spot(s){return sp[s]??100},async chain(s,o){const spot=sp[s]??100,out=[];
+ for(let d=0;d<=Math.min(o.maxDte,5);d++){const ymd=new Date(Date.now()+d*864e5).toISOString().slice(2,10).replace(/-/g,'');
+  for(const ty of['C','P'])for(let k=-10;k<=10;k++){const st=Math.round(spot*(1+k*.01)),iv=.35+Math.abs(k)*.01,T=Math.max(d,.3)/365,
+   dist=(ty==='C'?st-spot:spot-st)/(spot*iv*Math.sqrt(T)),px=Math.max(.03,spot*iv*Math.sqrt(T)*.4*Math.exp(-.5*Math.max(dist,0)**2));
+   out.push({symbol:s+ymd+ty+String(st*1000).padStart(8,'0'),bid:+(px*.95).toFixed(2),ask:+(px*1.05+.01).toFixed(2),delta:(ty==='C'?1:-1)*Math.max(.01,.4*Math.exp(-.5*Math.max(dist,0)**2)),theta:-px/2,iv})}}return out}}}
+async function run(){
+  $('go').textContent='Scanning…';$('go').disabled=true;
+  for(const k of F)try{localStorage.setItem('os_'+k,$(k).value)}catch{}
+  const o={...DEFAULTS,budget:+$('budget').value,maxDte:+$('maxDte').value,maxAsk:+$('maxAsk').value,maxSpreadPct:$('spread').value/100};
+  const P=($('kid').value&&$('ksec').value)?live($('kid').value.trim(),$('ksec').value.trim()):demo();
+  const syms=$('symbols').value.toUpperCase().split(',').map(s=>s.trim()).filter(s=>/^[A-Z.]{1,6}$/.test(s)).slice(0,25);
+  const res=[],errs=[];
+  await Promise.all(syms.map(async s=>{try{res.push(...scan(await P.chain(s,o),await P.spot(s),o))}catch(e){errs.push(s+': '+e.message)}}));
+  res.sort((a,b)=>b.score-a.score);
+  const d={provider:P.name,asOf:new Date().toISOString(),count:res.length,results:res.slice(0,40),errors:errs};
+  try{
+    $('meta').textContent=`${d.provider==='demo'?'DEMO DATA (synthetic) · ':''}${d.count} matches · ${new Date(d.asOf).toLocaleTimeString()}`;
+    $('out').innerHTML=(d.errors.length?`<div class="warn">${d.errors.map(e=>e.replace(/</g,'&lt;')).join('<br>')}</div>`:'')+
+    d.results.map((r,i)=>`<div class="c"><div class="h"><span class="sym">${i+1}. ${r.underlying} <span class="${r.type}">${usd(r.strike)} ${r.type.toUpperCase()}</span></span><span class="mu">${r.expiry} · ${r.dte}d</span></div>
+    <div class="g"><div>Ask<b>${usd(r.ask)}</b></div><div>Per contract<b>${usd(r.costPerContract)}</b></div><div>Buy ${r.contracts}×<b>${usd(r.totalCost)}</b></div>
+    <div>Spot → B/E<b>${usd(r.spot)} → ${usd(r.breakeven)}</b></div><div>Move needed<b>${r.movePct}% (${r.sigmasToBreakeven}σ)</b></div><div>Model P(profit)<b>${r.probProfitPct}%</b></div>
+    <div>Delta<b>${r.delta}</b></div><div>IV<b>${r.ivPct}%</b></div><div>Spread<b>${r.spreadPct}%</b></div></div>
+    <div class="sc">If ${r.underlying} hits ${usd(r.scenarios.s1.price)} (1σ): <b>${r.scenarios.s1.multiple.toFixed(1)}×</b> · ${usd(r.scenarios.s15.price)} (1.5σ): <b>${r.scenarios.s15.multiple.toFixed(1)}×</b> · ${usd(r.scenarios.s2.price)} (2σ): <b>${r.scenarios.s2.multiple.toFixed(1)}×</b> <span class="mu">(value at expiry)</span></div>
+    <div class="occ">${r.contract}</div></div>`).join('')||'<div class="warn">No contracts matched. Loosen filters or try during market hours.</div>';
+  }catch(e){$('out').innerHTML='<div class="warn">'+e.message+'</div>'}
+  $('go').textContent='Scan now';$('go').disabled=false;
+}
+$('go').onclick=run;run();
+</script></body></html>
